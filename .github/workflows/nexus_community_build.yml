@@ -1,0 +1,247 @@
+name: Nexus Community Build
+
+# Builds the `community` firmware set (the shared nexus-targets.txt list) on
+# every push to meshtacore, and refreshes a rolling DRAFT release with the
+# result. Publishing stays manual. All flag and target logic lives in
+# build-nexus.sh and bin/nexus_community_targets.py - this file only schedules
+# and ships.
+
+on:
+  push:
+    branches: [meshtacore]
+    paths:
+      - "src/**"
+      - "variants/**"
+      - "platformio.ini"
+      - "build-nexus.sh"
+      - "nexus-keys-lib.sh"
+      - "nexus-targets.txt"
+      - "bin/**"
+      - ".github/workflows/nexus_community_build.yml"
+  # inputs are empty on push, which means the shared target list and a rolling
+  # draft; both become overridable only from here.
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "Space-separated target override (empty = nexus-targets.txt)"
+        required: false
+        default: ""
+        type: string
+      tag:
+        description: "Snapshot tag for a keepable draft (empty = rolling draft)"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: nexus-community-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: read-all
+
+jobs:
+  targets:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install "platformio==6.1.19"
+      - name: Resolve targets
+        id: m
+        env:
+          OVERRIDE: ${{ inputs.targets }}
+        run: |
+          if [[ -n "$OVERRIDE" ]]; then
+            MATRIX=$(python3 -c 'import json,sys; print(json.dumps([{"board": t} for t in sys.argv[1].split()]))' "$OVERRIDE")
+          else
+            MATRIX=$(python3 bin/nexus_community_targets.py)
+          fi
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "$MATRIX" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: targets
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.targets.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # The shared list covers nRF52 and ESP32, so the cache spans both trees.
+      # Scoped to pio6119-py312 so a 6.2.0/Python 3.15 cache cannot poison it.
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio6119-py312-${{ runner.os }}-nexus-${{ hashFiles('platformio.ini', 'variants/**/platformio.ini', 'nexus-targets.txt') }}
+          restore-keys: |
+            pio6119-py312-${{ runner.os }}-nexus-
+
+      - name: Guard against gutted tool-scons cache
+        run: |
+          TS="$HOME/.platformio/packages/tool-scons"
+          if [ -d "$TS" ] && ! find "$TS" -name FortranCommon.py -print -quit | grep -q .; then
+            echo "tool-scons present but gutted - removing for clean reinstall"
+            rm -rf "$TS"
+          else
+            echo "tool-scons OK or absent (PIO installs on demand)"
+          fi
+
+      - name: Lock PlatformIO and ESP32 penv to 6.1.19
+        # Core 6.2.0 wipes tool-scons during ESP-IDF builds, so link dies with
+        # "No module named 'SCons.Tool.FortranCommon'". 6.1.19 is last known-good.
+        run: |
+          mkdir -p "$HOME/.platformio/packages"
+          echo '{"last_version": "6.1.19", "last_check": {"platformio_upgrade": 2147483647, "prune_system": 2147483647}}' > "$HOME/.platformio/appstate.json"
+          pip install -U "platformio==6.1.19"
+          if [ ! -f "$HOME/.platformio/penv/bin/python" ] || ! "$HOME/.platformio/penv/bin/python" -c "import pioarduino; assert pioarduino.__version__ == '6.1.19'" 2>/dev/null; then
+            echo "Pre-creating ~/.platformio/penv pinned to 6.1.19..."
+            rm -rf "$HOME/.platformio/penv"
+            python -m venv "$HOME/.platformio/penv"
+            "$HOME/.platformio/penv/bin/pip" install --upgrade "uv>=0.1.0"
+            "$HOME/.platformio/penv/bin/pip" install "pioarduino==6.1.19" "platformio==6.1.19"
+          fi
+          if [ -d "$HOME/.platformio/packages/tool-scons" ]; then
+            touch "$HOME/.platformio/packages/tool-scons/.piokeep"
+          fi
+          for scons_tool_dir in $(find "$HOME/.platformio/packages" -maxdepth 3 -type d -name "Tool" 2>/dev/null); do
+            if [ -f "$scons_tool_dir/linkCommon/__init__.py" ] && [ ! -f "$scons_tool_dir/FortranCommon.py" ]; then
+              echo "Adding FortranCommon fallback shim to $scons_tool_dir"
+              printf '%s\n' \
+                '"""Fallback shim for SCons FortranCommon to prevent link crashes"""' \
+                'def isfortran(env, source): return False' \
+                'def add_all_to_env(env): pass' \
+                'def add_fortran_to_env(env): pass' > "$scons_tool_dir/FortranCommon.py"
+            fi
+          done
+
+      - name: Build ${{ matrix.target.board }}
+        run: ./build-nexus.sh community --targets "${{ matrix.target.board }}" --no-clean
+
+      - name: Store artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: nexus-community-${{ matrix.target.board }}-${{ github.sha }}
+          overwrite: true
+          retention-days: 14
+          path: outbuilds/community-jt-firmware/*
+
+  draft-release:
+    name: Refresh draft release
+    needs: [targets, build]
+    # A single failed target must not block shipping the ones that compiled.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read version
+        id: version
+        env:
+          BUILD_LOCATION: local
+        run: echo "long=$(./bin/buildinfo.py long)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: nexus-community-*
+          merge-multiple: true
+          path: ./artifacts
+
+      # Fail closed: the rolling draft is overwritten below, so an empty
+      # download would replace a working bundle with nothing.
+      - name: Verify artifacts
+        run: |
+          shopt -s nullglob
+          files=(./artifacts/firmware-*)
+          echo "Artifact files: ${#files[@]}"
+          (( ${#files[@]} > 0 )) || { echo "::error::No firmware artifacts downloaded."; exit 1; }
+
+      - name: Resolve release tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SNAPSHOT: ${{ inputs.tag }}
+          VERSION: ${{ steps.version.outputs.long }}
+        run: |
+          TAG="${SNAPSHOT:-meshtacore-community-latest}"
+          # A published release belongs to a shipped build: never overwrite its
+          # assets (this repo is public). Retag the rolling draft, and refuse
+          # outright when the published tag was requested explicitly.
+          if gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null | grep -q false; then
+            if [[ -n "$SNAPSHOT" ]]; then
+              echo "::error::Release '$TAG' is published; refusing to overwrite it. Use a new tag."
+              exit 1
+            fi
+            TAG="meshtacore-community-${VERSION}"
+            echo "Rolling tag already published; drafting \`$TAG\` instead." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Tag \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Write release notes
+        env:
+          MATRIX: ${{ needs.targets.outputs.matrix }}
+          VERSION: ${{ steps.version.outputs.long }}
+        run: |
+          TARGETS=$(printf '%s' "$MATRIX" | python3 -c 'import json,sys; print(", ".join(r["board"] for r in json.load(sys.stdin)))')
+          cat > ./notes.md <<EOF
+          Community firmware - \`$VERSION\`
+
+          - Commit: \`${{ github.sha }}\`
+          - Targets: $TARGETS
+          - Run: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          Download only the file for your board:
+
+          - \`firmware-<target>-<version>.uf2\` - copy it onto the device in UF2/DFU mode.
+          - \`firmware-<target>-<version>.zip\` - OTA payload (\`.bin\` + manifest), for the app or \`meshtastic --ota-update\`.
+          EOF
+          cat ./notes.md
+
+      - name: Upload to existing draft
+        if: steps.tag.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          # Every asset name carries the version, so refreshing the rolling draft
+          # means clearing the previous build's files first: --clobber alone only
+          # replaces identical names and would let old versions pile up.
+          gh release view "$TAG" --json assets --jq '.assets[].name' |
+            while read -r name; do gh release delete-asset "$TAG" "$name" --yes; done
+          gh release upload "$TAG" ./artifacts/firmware-* --clobber
+          echo "### Assets" >> "$GITHUB_STEP_SUMMARY"
+          gh release view "$TAG" --json assets --jq '.assets[].name' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create draft release
+        if: steps.tag.outputs.exists != 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Meshtacore Community Build
+          draft: true
+          prerelease: true
+          body_path: ./notes.md
+          files: ./artifacts/firmware-*
