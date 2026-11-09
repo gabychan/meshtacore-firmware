@@ -92,6 +92,7 @@ on:
           - m5stack-unitc6l
           - tlora-c6
           - picow
+          - rp2040-lora
           - custom
         default: heltec-v3
       custom_target:
