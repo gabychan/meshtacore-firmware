@@ -3,7 +3,7 @@ name: Deploy Website & Docs to GitHub Pages
 on:
   push:
     branches:
-      - main
+      - meshtacore
     paths:
       - "custom_builder_web/**"
       - ".github/workflows/pages.yml"
