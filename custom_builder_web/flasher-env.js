@@ -1,7 +1,7 @@
 // Glue between the flasher modules and the classic scripts of the builder pages (crypto.js, localStorage).
 
 // Same repository as REPO_OWNER/REPO_NAME in app.js; flasher.html does not load app.js.
-export const REPO = "xejarque/meshtacore-firmware";
+export const REPO = "gabychan/meshtacore-firmware";
 
 const TOKEN_KEY = "meshtacore_gh_token"; // the key app.js saves the builder's token under
 
