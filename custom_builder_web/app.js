@@ -1,8 +1,8 @@
 // Meshtacore Custom Firmware Builder - Web Frontend
 
-const REPO_OWNER = "xejarque";
+const REPO_OWNER = "gabychan";
 const REPO_NAME = "meshtacore-firmware";
-const DEFAULT_BRANCH = "main";
+const DEFAULT_BRANCH = "meshtacore";
 const WORKFLOW_FILE = "custom_builder.yml";
 
 /** Ids of the dispatch runs that already exist, so the flasher never mistakes one of them for the new build. */
