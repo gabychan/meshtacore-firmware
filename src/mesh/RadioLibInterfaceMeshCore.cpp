@@ -70,17 +70,25 @@ bool RadioLibInterface::sendRawFrame(const uint8_t *bytes, size_t len)
     return true;
 }
 
-bool RadioLibInterface::meshCoreTxAllowed()
+bool RadioLibInterface::meshCoreTxPossible()
 {
     if (disabled || !config.lora.tx_enabled)
         return false;
     // MeshCore is LoRa with its own sync word: not on the alternate modem (FSK/FLRC), and only on chips whose driver
     // sets that sync word for a raw frame.
-    if (altModemActive() || !meshCoreTxSupported())
-        return false;
+    return !altModemActive() && meshCoreTxSupported();
+}
+
+bool RadioLibInterface::meshCoreWithinDutyCycle()
+{
     // Same duty-cycle guard as Router::send: a foreign-protocol frame must not push us over the regional limit.
     const float effectiveDutyCycle = getEffectiveDutyCycle();
     return config.lora.override_duty_cycle || effectiveDutyCycle >= 100 || airTime->utilizationTXPercent() <= effectiveDutyCycle;
+}
+
+bool RadioLibInterface::meshCoreTxAllowed()
+{
+    return meshCoreTxPossible() && meshCoreWithinDutyCycle();
 }
 
 bool RadioLibInterface::queueMeshCoreFrame(const uint8_t *bytes, size_t len)
@@ -367,12 +375,12 @@ static bool saveMeshCoreContacts()
     constexpr size_t BATCH = 4;
     uint8_t batch[BATCH * RECORD_LEN];
     size_t inBatch = 0;
-    for (size_t rank = total; rank-- > 0;) {
-        const MeshCoreRepeaterName *e = names.nthNewest(rank);
-        if (!e)
-            continue;
+    // The oldest one kept is found once; from there each newer one is a single pass, not a rank search per record.
+    const MeshCoreRepeaterName *e = total ? names.nthNewest(total - 1) : nullptr;
+    for (size_t written = 0; e && written < total; e = names.nextNewer(e->heard)) {
         MeshCoreNodeFile::writeRepeaterRecord(&batch[inBatch++ * RECORD_LEN], *e);
-        if (inBatch == BATCH || rank == 0) {
+        written++;
+        if (inBatch == BATCH || written == total) {
             out.write(batch, inBatch * RECORD_LEN);
             inBatch = 0;
         }
@@ -825,10 +833,18 @@ void RadioLibInterface::maybeSendMeshCoreFrame()
         }
         return;
     }
-    // A permanent refusal would otherwise retry the same frame forever.
-    if (!meshCoreTxAllowed()) {
-        meshCoreRepeater.clearPendingFrame();
-        meshCoreRepeater.txDropped++;
+    // A permanent refusal would otherwise retry the same frame forever. It never went on air, so it is no contention
+    // sample either.
+    if (!meshCoreTxPossible()) {
+        meshCoreRepeater.dropPendingFrame();
+        return;
+    }
+    // Over the duty cycle the frame waits for the window to free up; a relay that waits too long expires on its own.
+    if (!meshCoreWithinDutyCycle()) {
+        if (logDefer) {
+            LOG_DEBUG("MeshCore TX deferred: duty cycle");
+            lastDeferLogMs = millis();
+        }
         return;
     }
     uint8_t frame[MeshCoreRepeater::MAX_FRAME_LEN];

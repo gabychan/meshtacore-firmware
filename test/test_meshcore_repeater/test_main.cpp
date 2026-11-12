@@ -82,6 +82,7 @@ void test_stats_reply_is_cut_to_a_small_buffer()
 void setUp(void)
 {
     MeshCoreRepeater::setIgnorePredicate(nullptr);
+    MeshCoreRepeater::forgetVerifiedAdverts();
     Time::setTestMillis(1000);
     config.device.role = meshtastic_Config_DeviceConfig_Role_CLIENT;
     config.device.rebroadcast_mode = meshtastic_Config_DeviceConfig_RebroadcastMode_ALL;
@@ -888,6 +889,45 @@ void test_stale_pending_relay_is_dropped_for_new_frame()
     TEST_ASSERT_TRUE(repeater.hasPendingFrame());    // the new one is queued
 }
 
+// An expired relay never went on air either, so like an evicted one it must not stay remembered as seen.
+void test_expired_relay_is_forgotten()
+{
+    MeshCoreRepeater repeater;
+    uint8_t stale[64];
+    const size_t staleLen = makeFloodFrame(stale, kTxtMsg, 2, 1, 0x10, 0x10);
+    repeater.handleReceivedFrame(stale, staleLen, 5, kAirtimeMs);
+
+    Time::advanceTestMillis(11000); // past DUPE_WINDOW_MS: the next frame heard expires it
+    uint8_t other[64];
+    const size_t otherLen = makeFloodFrame(other, kTxtMsg, 2, 1, 0x10, 0x20);
+    repeater.handleReceivedFrame(other, otherLen, 5, kAirtimeMs);
+    TEST_ASSERT_EQUAL_UINT32(1, repeater.txDropped);
+
+    const uint32_t dupBefore = repeater.rxDup;
+    repeater.handleReceivedFrame(stale, staleLen, 5, kAirtimeMs);
+    TEST_ASSERT_EQUAL_UINT32(dupBefore, repeater.rxDup);
+}
+
+// A frame refused for good (TX disabled) never went on air: dropping it counts it, forgets its hash and leaves the
+// contention estimate alone.
+void test_dropped_pending_frame_is_forgotten_and_not_a_contention_sample()
+{
+    MeshCoreRepeater repeater;
+    uint8_t buf[64];
+    const size_t len = makeFloodFrame(buf, kTxtMsg, 2, 1, 0x10, 0x10);
+    repeater.handleReceivedFrame(buf, len, 5, kAirtimeMs);
+    const float factorBefore = repeater.getFloodDelayFactor();
+
+    repeater.dropPendingFrame();
+    TEST_ASSERT_FALSE(repeater.hasPendingFrame());
+    TEST_ASSERT_EQUAL_UINT32(1, repeater.txDropped);
+    TEST_ASSERT_EQUAL_FLOAT(factorBefore, repeater.getFloodDelayFactor());
+
+    const uint32_t dupBefore = repeater.rxDup;
+    repeater.handleReceivedFrame(buf, len, 5, kAirtimeMs);
+    TEST_ASSERT_EQUAL_UINT32(dupBefore, repeater.rxDup);
+}
+
 void test_take_pending_frame_copies_without_clearing()
 {
     MeshCoreRepeater repeater;
@@ -1099,6 +1139,19 @@ void test_discover_request_gets_a_reply()
     TEST_ASSERT_EQUAL_MEMORY(repeater.getIdentityPub(), &out[8], 32);
     TEST_ASSERT_TRUE(repeater.pendingIsOwn());
     TEST_ASSERT_EQUAL_UINT32(0, repeater.txRelayed);
+}
+
+// SNR x4 travels in a signed byte: a reading past 31.75 dB saturates at 127 instead of wrapping negative.
+void test_discover_reply_saturates_a_strong_snr()
+{
+    MeshCoreRepeater repeater;
+    giveIdentity(repeater);
+    uint8_t req[2 + 10] = {(0x0B << 2) | 0x02, 0x00, 0x80, 1 << 2, 0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0};
+
+    repeater.handleReceivedFrame(req, sizeof(req), 40.0f, kAirtimeMs);
+    uint8_t out[MeshCoreRepeater::MAX_FRAME_LEN];
+    TEST_ASSERT_GREATER_THAN(3, repeater.takePendingFrame(out, sizeof(out)));
+    TEST_ASSERT_EQUAL_INT8(127, (int8_t)out[3]);
 }
 
 // --- relay alias: the second identity that puts a name on the hop we append ---
@@ -1640,6 +1693,24 @@ void test_advert_with_valid_signature_is_relayed()
     TEST_ASSERT_EQUAL_UINT32(0, repeater.rxDropped);
 }
 
+// Every route of one advert carries the same payload: the Ed25519 check runs once, later copies are answered from the
+// cache. A payload that differs in a single byte is not in it and still fails.
+void test_a_verified_advert_is_not_checked_again()
+{
+    uint8_t buf[MeshCoreRepeater::MAX_FRAME_LEN];
+    const size_t len = makeSignedAdvertFlood(buf, 1);
+    const size_t payloadAt = 2 + 1;
+    const uint32_t before = MeshCoreRepeater::advertSignatureChecks;
+
+    TEST_ASSERT_TRUE(MeshCoreRepeater::verifyAdvert(&buf[payloadAt], len - payloadAt));
+    TEST_ASSERT_TRUE(MeshCoreRepeater::verifyAdvert(&buf[payloadAt], len - payloadAt));
+    TEST_ASSERT_EQUAL_UINT32(before + 1, MeshCoreRepeater::advertSignatureChecks);
+
+    buf[len - 1] ^= 0x01;
+    TEST_ASSERT_FALSE(MeshCoreRepeater::verifyAdvert(&buf[payloadAt], len - payloadAt));
+    TEST_ASSERT_EQUAL_UINT32(before + 2, MeshCoreRepeater::advertSignatureChecks);
+}
+
 // --- TRACE ---
 
 // Direct TRACE: path holds the SNRs gathered so far; payload = tag, auth, flags (hash size exponent), hashes to visit.
@@ -1725,6 +1796,22 @@ void test_trace_revisiting_us_is_forwarded_twice()
     repeater.clearPendingFrame();
 
     len = makeTrace(buf, 2, hashes, 3, 0); // the very same frame again is a duplicate
+    repeater.handleReceivedFrame(buf, len, 5, kAirtimeMs);
+    TEST_ASSERT_FALSE(repeater.hasPendingFrame());
+}
+
+// The path count has 6 bits: a 64th SNR would spill into the hash-size bits, so a full path is not forwarded.
+void test_trace_with_a_full_path_is_not_forwarded()
+{
+    MeshCoreRepeater repeater;
+    giveIdentity(repeater);
+    const uint8_t us = repeater.getIdentityPub()[0];
+    uint8_t hashes[64];
+    memset(hashes, 0x55, sizeof(hashes));
+    hashes[63] = us;
+    uint8_t buf[MeshCoreRepeater::MAX_FRAME_LEN];
+    size_t len = makeTrace(buf, 63, hashes, 64, 0);
+
     repeater.handleReceivedFrame(buf, len, 5, kAirtimeMs);
     TEST_ASSERT_FALSE(repeater.hasPendingFrame());
 }
@@ -2167,6 +2254,8 @@ void setup()
     RUN_TEST(test_dupe_postpones_pending_relay);
     RUN_TEST(test_relay_deadline_survives_millis_wrap);
     RUN_TEST(test_stale_pending_relay_is_dropped_for_new_frame);
+    RUN_TEST(test_expired_relay_is_forgotten);
+    RUN_TEST(test_dropped_pending_frame_is_forgotten_and_not_a_contention_sample);
     RUN_TEST(test_take_pending_frame_copies_without_clearing);
     RUN_TEST(test_advert_is_signed_and_parseable);
     RUN_TEST(test_advert_type_follows_the_meshtastic_role);
@@ -2175,6 +2264,7 @@ void setup()
     RUN_TEST(test_flood_relay_appends_our_hash);
     RUN_TEST(test_direct_frame_forwarded_only_as_next_hop);
     RUN_TEST(test_discover_request_gets_a_reply);
+    RUN_TEST(test_discover_reply_saturates_a_strong_snr);
     RUN_TEST(test_relay_alias_is_derived_and_off_until_enabled);
     RUN_TEST(test_flood_relay_appends_the_alias_when_enabled);
     RUN_TEST(test_direct_frame_addressed_to_the_alias_is_forwarded);
@@ -2198,10 +2288,12 @@ void setup()
     RUN_TEST(test_advert_with_bad_signature_is_not_relayed);
     RUN_TEST(test_forged_advert_does_not_block_the_next_frame);
     RUN_TEST(test_advert_with_valid_signature_is_relayed);
+    RUN_TEST(test_a_verified_advert_is_not_checked_again);
     RUN_TEST(test_trace_is_forwarded_with_our_snr);
     RUN_TEST(test_trace_is_ignored_unless_we_are_next);
     RUN_TEST(test_trace_needs_an_identity);
     RUN_TEST(test_trace_revisiting_us_is_forwarded_twice);
+    RUN_TEST(test_trace_with_a_full_path_is_not_forwarded);
     RUN_TEST(test_trace_with_wider_hashes);
     RUN_TEST(test_multipart_ack_is_forwarded_as_plain_ack);
     RUN_TEST(test_multipart_other_types_are_not_forwarded);

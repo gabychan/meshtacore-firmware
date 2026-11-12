@@ -124,6 +124,9 @@ class MeshCoreRepeater
     /** Remove the picked frame (sent or refused): folds a relayed flood's dupe sample into the contention estimate. */
     void clearPendingFrame();
 
+    /** Drop the picked frame without sending it (TX refused for good): not a contention sample, its hash is forgotten. */
+    void dropPendingFrame();
+
     /** The picked frame went on air: counts it and keeps the contention estimate from going stale. */
     void markRelayed();
 
@@ -204,6 +207,12 @@ class MeshCoreRepeater
 
     /** Check an ADVERT payload's Ed25519 signature over pub_key || timestamp || app_data. */
     static bool verifyAdvert(const uint8_t *payload, size_t payloadLen);
+
+    /** Ed25519 verifications actually run; a payload already proven good is answered from a small cache instead. */
+    static uint32_t advertSignatureChecks;
+
+    /** Empty the cache of verified ADVERT payloads (tests start from a clean slate). */
+    static void forgetVerifiedAdverts();
 
     /**
      * Encode an ADVERT for this node, signed over pub||timestamp||app_data exactly as MeshCore's Mesh::createAdvert does.
@@ -540,6 +549,8 @@ class MeshCoreRepeater
     /** Index of the frame to send next: best priority among the due ones, else the soonest to become due. -1 if empty. */
     int pickNext() const;
     void release(int index);
+    /** Drop a frame that never went on air: forget its hash so a later copy may be relayed, and count it dropped. */
+    void discardUnsent(int index);
     /** Index of the frame takePendingFrame() picked (or would pick), -1 if it is gone from the queue. */
     int selectedIndex() const;
     /** Drop floods that waited longer than a copy of them could still matter (they were never forwarded). */

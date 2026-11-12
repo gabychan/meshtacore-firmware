@@ -28,7 +28,7 @@ static bool isKnownPayloadType(uint8_t type)
 }
 
 // Mesh::onRecvPacket forwards an ADVERT only when its Ed25519 signature over pub_key || timestamp || app_data holds.
-static bool advertSignatureValid(const uint8_t *payload, size_t payloadLen)
+static bool ed25519AdvertValid(const uint8_t *payload, size_t payloadLen)
 {
     constexpr size_t signedHeadLen = MC_PUB_KEY_SIZE + 4;
     constexpr size_t appDataAt = signedHeadLen + MC_SIGNATURE_SIZE;
@@ -41,7 +41,81 @@ static bool advertSignatureValid(const uint8_t *payload, size_t payloadLen)
     uint8_t message[signedHeadLen + MAX_ADVERT_DATA_SIZE];
     memcpy(message, payload, signedHeadLen);
     memcpy(&message[signedHeadLen], &payload[appDataAt], appLen);
+    MeshCoreRepeater::advertSignatureChecks++;
     return Ed25519::verify(&payload[signedHeadLen], payload, message, signedHeadLen + appLen);
+}
+
+namespace
+{
+// The same ADVERT arrives once per route and is checked by the firewall, the companion and the relay queue. An Ed25519
+// verify costs tens of ms on an nRF52 with the receiver deaf meanwhile, so a payload proven good is remembered by its
+// SHA-256 (truncated, still collision resistant; the 32-bit dedupe hash is not and a forger could match it).
+class VerifiedAdverts
+{
+  public:
+    static constexpr size_t DIGEST_LEN = 16;
+
+    bool contains(const uint8_t digest[DIGEST_LEN]) const
+    {
+        for (const Entry &e : entries) {
+            if (e.used && memcmp(e.digest, digest, DIGEST_LEN) == 0)
+                return true;
+        }
+        return false;
+    }
+
+    void add(const uint8_t digest[DIGEST_LEN])
+    {
+        Entry &e = entries[next];
+        memcpy(e.digest, digest, DIGEST_LEN);
+        e.used = true;
+        next = (uint8_t)((next + 1) % CAPACITY);
+    }
+
+    void clear()
+    {
+        for (Entry &e : entries)
+            e.used = false;
+        next = 0;
+    }
+
+    static void digestOf(const uint8_t *payload, size_t len, uint8_t out[DIGEST_LEN])
+    {
+        SHA256 sha;
+        sha.update(payload, len);
+        sha.finalize(out, DIGEST_LEN);
+    }
+
+  private:
+    static constexpr size_t CAPACITY = 8;
+    struct Entry {
+        uint8_t digest[DIGEST_LEN];
+        bool used;
+    };
+    Entry entries[CAPACITY] = {};
+    uint8_t next = 0;
+};
+
+VerifiedAdverts verifiedAdverts;
+} // namespace
+
+uint32_t MeshCoreRepeater::advertSignatureChecks = 0;
+
+static bool advertSignatureValid(const uint8_t *payload, size_t payloadLen)
+{
+    uint8_t digest[VerifiedAdverts::DIGEST_LEN];
+    VerifiedAdverts::digestOf(payload, payloadLen, digest);
+    if (verifiedAdverts.contains(digest))
+        return true;
+    if (!ed25519AdvertValid(payload, payloadLen))
+        return false;
+    verifiedAdverts.add(digest);
+    return true;
+}
+
+void MeshCoreRepeater::forgetVerifiedAdverts()
+{
+    verifiedAdverts.clear();
 }
 
 uint8_t MeshCoreRepeater::nodeTypeForRole(int role)
@@ -373,12 +447,20 @@ uint32_t MeshCoreRepeater::directDelayMs(uint32_t airtimeMs)
     return DELAY_FLOOR_MS + (uint32_t)random(0, (long)airtimeMs + 1);
 }
 
+/// MeshCore carries SNR as a signed byte in quarter dB; out-of-range readings saturate instead of wrapping.
+static uint8_t snrQuarterDbByte(float snr)
+{
+    const float x4 = snr * 4;
+    return (uint8_t)(int8_t)(x4 > 127.0f ? 127.0f : (x4 < -128.0f ? -128.0f : x4));
+}
+
 void MeshCoreRepeater::handleTrace(const uint8_t *raw, size_t len, const FrameInfo &info, float snr, uint32_t airtimeMs)
 {
     // Mesh::onRecvPacket, TRACE: payload = tag(4) auth(4) flags(1) then the hashes to visit; the path field holds
     // one SNR byte (x4) per hop already taken, so path_len indexes the hash list. flags&3 is the hash size exponent.
     constexpr size_t traceHeadLen = 4 + 4 + 1;
-    if (!hasIdentityKey || info.path_hash_size != 1 || info.path_hash_count >= MAX_PATH_SIZE || info.payload_len < traceHeadLen)
+    if (!hasIdentityKey || info.path_hash_size != 1 || info.path_hash_count >= MC_PATH_COUNT_MASK ||
+        info.payload_len < traceHeadLen) // a full path has no room for our SNR: one more would spill into the size bits
         return;
 
     const uint8_t *payload = &raw[info.header_len];
@@ -406,9 +488,7 @@ void MeshCoreRepeater::handleTrace(const uint8_t *raw, size_t len, const FrameIn
     uint8_t forwarded[MAX_FRAME_LEN];
     memcpy(forwarded, raw, snrAt);
     forwarded[pathLenAt] = raw[pathLenAt] + 1;
-    float snrX4 = snr * 4;
-    snrX4 = snrX4 > 127.0f ? 127.0f : (snrX4 < -128.0f ? -128.0f : snrX4);
-    forwarded[snrAt] = (uint8_t)(int8_t)snrX4;
+    forwarded[snrAt] = snrQuarterDbByte(snr);
     memcpy(&forwarded[snrAt + 1], &raw[snrAt], len - snrAt);
 
     if (!queueRelay(forwarded, len + 1, hash, airtimeMs, directDelayMs(airtimeMs), PRIORITY_DIRECT))
@@ -501,7 +581,7 @@ bool MeshCoreRepeater::queueDiscoverReply(const uint8_t pub[32], uint8_t type, b
     frame[0] = (MC_PAYLOAD_TYPE_CONTROL << 2) | MC_ROUTE_DIRECT;
     frame[1] = 0x00; // zero hop
     frame[2] = MC_CTL_DISCOVER_RESP | type;
-    frame[3] = (uint8_t)(int8_t)(snr * 4);
+    frame[3] = snrQuarterDbByte(snr);
     memcpy(&frame[4], tag, 4);
     memcpy(&frame[8], pub, keyLen);
 
@@ -646,10 +726,7 @@ int MeshCoreRepeater::claimSlot(uint8_t priority)
     if (victim < 0)
         return -1;
 
-    // It was remembered when queued, but never forwarded: a later copy must be eligible again.
-    dedup.forget(queue[victim].hash32);
-    release(victim);
-    txDropped++;
+    discardUnsent(victim);
     return victim;
 }
 
@@ -690,14 +767,20 @@ void MeshCoreRepeater::release(int index)
         busyAttempts = 0;
 }
 
+void MeshCoreRepeater::discardUnsent(int index)
+{
+    // It was remembered when queued, but never forwarded: a later copy must be eligible again.
+    dedup.forget(queue[index].hash32);
+    release(index);
+    txDropped++;
+}
+
 void MeshCoreRepeater::expireStale()
 {
     for (size_t i = 0; i < QUEUE_SIZE; i++) {
         const QueuedFrame &f = queue[i];
-        if (f.len != 0 && !f.own && !Throttle::isWithinTimespanMs(f.firstSeenMs, DUPE_WINDOW_MS)) {
-            release((int)i);
-            txDropped++;
-        }
+        if (f.len != 0 && !f.own && !Throttle::isWithinTimespanMs(f.firstSeenMs, DUPE_WINDOW_MS))
+            discardUnsent((int)i);
     }
 }
 
@@ -856,6 +939,15 @@ bool MeshCoreRepeater::pendingIsOwn() const
     return pick >= 0 && queue[pick].own;
 }
 
+void MeshCoreRepeater::dropPendingFrame()
+{
+    const int pick = selectedIndex();
+    selected = -1;
+    selectedHash = 0;
+    if (pick >= 0)
+        discardUnsent(pick);
+}
+
 void MeshCoreRepeater::clearPendingFrame()
 {
     const int pick = selectedIndex();
@@ -882,7 +974,8 @@ void MeshCoreRepeater::foldContentionSample(const QueuedFrame &f)
     } else {
         emaX256 = (uint32_t)((int32_t)emaX256 + (diff >> EMA_SHIFT));
     }
-    finalizedSamples++;
+    if (finalizedSamples < WARMUP_SAMPLES) // past warmup the count only gates it; letting it wrap would restart warmup
+        finalizedSamples++;
 }
 
 void MeshCoreRepeater::applyLazyDecay()

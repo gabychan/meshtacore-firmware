@@ -1447,10 +1447,8 @@ size_t MeshCoreCompanion::formatNodeList(uint8_t typeFilter, char *out, size_t c
         });
     }
     // Newest first. A repeater is kept as a key prefix and a short name, so it has no RSSI to show.
-    for (size_t rank = 0; wantRepeaters && len < cap - 1; rank++) {
-        const MeshCoreRepeaterName *r = repeaters.nthNewest(rank);
-        if (!r)
-            break;
+    for (const MeshCoreRepeaterName *r = wantRepeaters ? repeaters.newest() : nullptr; r && len < cap - 1;
+         r = repeaters.nextOlder(r->heard)) {
         char name[MeshCoreRepeaterName::NAME_LEN + 1];
         r->copyName(name);
         char route[16];
@@ -2312,6 +2310,8 @@ void MeshCoreCompanion::handleAdvert(const uint8_t *raw, size_t len, const MeshC
         latMicro = (int32_t)readLe32(&payload[at]);
         lonMicro = (int32_t)readLe32(&payload[at + 4]);
         at += 8;
+        if (!isValidPositionMicro(latMicro, lonMicro))
+            latMicro = lonMicro = 0; // a bogus position is dropped: x10 into Meshtastic units would overflow int32
     }
     if (flags & 0x20)
         at += 2;
@@ -2367,9 +2367,15 @@ void MeshCoreCompanion::handleAdvert(const uint8_t *raw, size_t len, const MeshC
         return;
     }
 
-    // A contact we already trust under the same name only needs its LRU stamp refreshed: skip the signature check.
     MeshCoreNode *known = contactByPub(payload);
     if (isWorseCopy(known))
+        return;
+    // MeshCore drops an advert older than the last one it took from that key as a possible replay.
+    if (known && advertTime < known->lastAdvert)
+        return;
+    // The key and name are public, so even a known contact's advert must be signed: otherwise anyone could move it on
+    // the map or fake its route. Later copies of the same advert are answered from the verified cache.
+    if (!MeshCoreRepeater::verifyAdvert(payload, info.payload_len))
         return;
     if (known && strncmp(known->name, name, MeshCoreNode::NAME_LEN - 1) == 0) {
         nodes.touch(known);
@@ -2379,8 +2385,6 @@ void MeshCoreCompanion::handleAdvert(const uint8_t *raw, size_t len, const MeshC
         updatePosition(known->nodeNum, latMicro, lonMicro, rx);
         return;
     }
-    if (!MeshCoreRepeater::verifyAdvert(payload, info.payload_len))
-        return;
 
     MeshCoreNode *c = learnContact(payload, name);
     noteAdvert(c, advertTime, latMicro, lonMicro, snr, rssi, info.path_hash_count);

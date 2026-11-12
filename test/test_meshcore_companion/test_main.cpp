@@ -34,6 +34,7 @@ static const uint8_t kExpectedFrame[] = {
 
 void setUp(void)
 {
+    MeshCoreRepeater::forgetVerifiedAdverts();
     Time::setTestMillis(1000);
 }
 
@@ -179,6 +180,16 @@ void test_hop_fields_report_the_path_length(void)
 
     MeshCoreCompanion::hopFields(40, &start, &limit); // capped at what hop_start can express
     TEST_ASSERT_EQUAL_UINT8(7, start - limit);
+}
+
+// An ADVERT position is degrees x 1e6; Meshtastic wants x 1e7, so anything off the globe would overflow int32 on x10.
+void test_advert_position_off_the_globe_is_rejected(void)
+{
+    TEST_ASSERT_TRUE(MeshCoreCompanion::isValidPositionMicro(41385064, 2173403));
+    TEST_ASSERT_TRUE(MeshCoreCompanion::isValidPositionMicro(-90000000, 180000000));
+    TEST_ASSERT_FALSE(MeshCoreCompanion::isValidPositionMicro(90000001, 0));
+    TEST_ASSERT_FALSE(MeshCoreCompanion::isValidPositionMicro(0, -180000001));
+    TEST_ASSERT_FALSE(MeshCoreCompanion::isValidPositionMicro(INT32_MAX, INT32_MIN));
 }
 
 void test_round_trip(void)
@@ -2398,6 +2409,39 @@ static size_t buildAdvertWithPos(uint8_t *out, const uint8_t *seed, const uint8_
     return i;
 }
 
+// A contact's key and name are public, so an advert claiming to be a known contact proves nothing until its signature
+// holds. Regression guard: the old shortcut that skipped the check for a known contact under the same name, which let
+// anyone move that contact on the map; and an older genuine advert replayed over a newer one (MeshCore drops those).
+void test_known_contact_advert_must_be_signed_and_newer(void)
+{
+    GroupSetup s;
+    uint8_t remoteSeed[32];
+    for (int i = 0; i < 32; i++)
+        remoteSeed[i] = (uint8_t)(0x44 ^ i);
+    uint8_t remotePub[32];
+    Ed25519::derivePublicKey(remotePub, remoteSeed);
+
+    uint8_t frame[MeshCoreRepeater::MAX_FRAME_LEN];
+    size_t len = buildAdvertWithPos(frame, remoteSeed, remotePub, "Friend", 41387900, 2169900, 1792521507);
+    s.c.handleFrame(frame, len, 6.5f, -70);
+    const MeshCoreNode *n = s.c.nodes.find(remotePub);
+    TEST_ASSERT_NOT_NULL(n);
+    TEST_ASSERT_EQUAL_INT32(41387900, n->latitudeMicro);
+
+    len = buildAdvertWithPos(frame, remoteSeed, remotePub, "Friend", 10000000, 10000000, 1792521600);
+    frame[2 + 32 + 4] ^= 0x01; // break the signature
+    s.c.handleFrame(frame, len, 6.5f, -70);
+    TEST_ASSERT_EQUAL_INT32(41387900, n->latitudeMicro);
+
+    len = buildAdvertWithPos(frame, remoteSeed, remotePub, "Friend", 42000000, 2000000, 1792521600);
+    s.c.handleFrame(frame, len, 6.5f, -70);
+    TEST_ASSERT_EQUAL_INT32(42000000, n->latitudeMicro); // a newer genuine advert moves it
+
+    len = buildAdvertWithPos(frame, remoteSeed, remotePub, "Friend", 41387900, 2169900, 1792521507);
+    s.c.handleFrame(frame, len, 6.5f, -70);
+    TEST_ASSERT_EQUAL_INT32(42000000, n->latitudeMicro); // the older one replayed does not
+}
+
 // MeshCore nodes (repeaters and chat contacts) include positions in their adverts.
 // An earlier implementation hardcoded hopFields(1) in announcePosition(), which overwrote
 // the true hop distance with 1 in NodeDB and on client map/node lists.
@@ -2472,9 +2516,8 @@ void test_advert_with_position_announces_real_hops(void)
 }
 
 /**
- * Pins the unified formatting for direct neighbors in /mtc VECINOS and MESHCORE VECINOS.
- * Guards against regression of markdown bolding for node names, italics for metrics,
- * emoji indicators (direct bolt and signal), and UTF-8 truncation for long names.
+ * Pins the plain formatting for direct neighbors in /mtc VECINOS and MESHCORE VECINOS: "name SNRdB ago", no emojis
+ * or markdown (dropped to fit more neighbours per message), and UTF-8 safe truncation for long names.
  */
 void test_unified_vecinos_formatting(void)
 {
@@ -2487,9 +2530,7 @@ void test_unified_vecinos_formatting(void)
     char line[96];
     size_t len = meshtastic::NexusModule::formatNeighborLine(entry, 1020, line, sizeof(line));
     TEST_ASSERT_TRUE(len > 0);
-    TEST_ASSERT_NOT_NULL(strstr(line, "⚡ **Repeater-Sud**"));
-    TEST_ASSERT_NOT_NULL(strstr(line, "📶 *5.2dB*"));
-    TEST_ASSERT_NOT_NULL(strstr(line, "*2m*"));
+    TEST_ASSERT_EQUAL_STRING("Repeater-Sud 5.2dB 2m\n", line);
 
     meshtastic::NexusModule::DirectNeighborEntry longEntry = {};
     strncpy(longEntry.name, "SuperLongNodeName12345", sizeof(longEntry.name) - 1);
@@ -2499,8 +2540,8 @@ void test_unified_vecinos_formatting(void)
 
     len = meshtastic::NexusModule::formatNeighborLine(longEntry, 1020, line, sizeof(line));
     TEST_ASSERT_TRUE(len > 0);
-    TEST_ASSERT_NOT_NULL(strstr(line, "..**"));
-    TEST_ASSERT_NOT_NULL(strstr(line, "📶 *-3.5dB*"));
+    TEST_ASSERT_NOT_NULL(strstr(line, ".. -3.5dB"));
+    TEST_ASSERT_NULL(strstr(line, "*"));
 }
 
 /**
@@ -2637,6 +2678,7 @@ void setup()
     RUN_TEST(test_encode_matches_meshcore_vector);
     RUN_TEST(test_frame_uses_two_byte_path_hashes);
     RUN_TEST(test_hop_fields_report_the_path_length);
+    RUN_TEST(test_advert_position_off_the_globe_is_rejected);
     RUN_TEST(test_round_trip);
     RUN_TEST(test_rejects_wrong_channel);
     RUN_TEST(test_rejects_tampered_mac);
@@ -2731,6 +2773,7 @@ void setup()
     RUN_TEST(test_route_line_prints_only_the_requested_metrics);
     RUN_TEST(test_a_long_route_keeps_its_signal_line);
     RUN_TEST(test_advert_with_position_announces_real_hops);
+    RUN_TEST(test_known_contact_advert_must_be_signed_and_newer);
     RUN_TEST(test_unified_vecinos_formatting);
     RUN_TEST(test_meshcore_ping_formatting);
     RUN_TEST(test_handle_frame_carries_the_frequency_error);
