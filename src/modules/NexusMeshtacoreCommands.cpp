@@ -4,7 +4,9 @@
 // in NexusCommands.cpp, so a merge of the jentastic upstream does not collide with them: the dispatch chain in
 // handleNexusCommand() carries a single call to handleMeshtacoreCommand().
 
+#include "BootLoopGuard.h"
 #include "Channels.h"
+#include "FSCommon.h"
 #include "MeshService.h"
 #include "NodeDB.h"
 #include "Power.h"
@@ -281,9 +283,24 @@ void NexusModule::handleChemCommand(const char *arg)
         }
         battery_chemistry = chosen;
     }
-    snprintf(replyMsg, sizeof(replyMsg), "MESHTACORE: CHEM %s, full %u mV, cutoff %u mV per cell",
+    const bool nimhPack = battery_chemistry == (uint8_t)BatteryChemistry::NIMH;
+    snprintf(replyMsg, sizeof(replyMsg), "MESHTACORE: CHEM %s, full %u mV, cutoff %u mV per %s",
              batteryChemistryName((BatteryChemistry)battery_chemistry), activeBatteryOcv[0],
-             activeBatteryOcv[NUM_OCV_POINTS - 1]);
+             activeBatteryOcv[NUM_OCV_POINTS - 1], nimhPack ? "3-cell pack" : "cell");
+}
+
+/// Appends the boot-loop and low-flash flags to a HEALTH reply of length len, while they fit.
+void NexusModule::appendHealthWarnings(int len)
+{
+    auto append = [&](const char *fmt, unsigned value) {
+        if (len < 0 || (size_t)len >= sizeof(replyMsg))
+            return;
+        len += snprintf(replyMsg + len, sizeof(replyMsg) - len, fmt, value);
+    };
+    if (bootLoopGuard && bootLoopGuard->isLoopSuspected())
+        append("\nLoop: %u boots, TX held", (unsigned)bootLoopGuard->getStreak());
+    if (fsIsLowOnSpace())
+        append("\nFS low: %uB free", (unsigned)fsFreeBytes());
 }
 
 void NexusModule::handleHealthCommand()
@@ -343,7 +360,16 @@ void NexusModule::handleHealthCommand()
     float txUtil = (airTime != NULL) ? airTime->utilizationTXPercent() : 0.0f;
     int32_t noise = (RadioLibInterface::instance) ? RadioLibInterface::instance->getAverageNoiseFloor() : -120;
 
-    snprintf(replyMsg, sizeof(replyMsg),
-             "MESHTACORE HEALTH:\nUp: %s\nBoot: %s\nBat: %s\nHeap: %s\nTemp: %.1fC\nChU: %.1f%% TxU: %.1f%% Noise: %ddBm", upBuf,
-             bootBuf, batBuf, heapBuf, temp, chUtil, txUtil, (int)noise);
+    int len = snprintf(replyMsg, sizeof(replyMsg),
+                       "MESHTACORE HEALTH:\nUp: %s\nBoot: %s\nBat: %s\nHeap: %s\nTemp: %.1fC\nChU: %.1f%% TxU: %.1f%% Noise: %ddBm",
+                       upBuf, bootBuf, batBuf, heapBuf, temp, chUtil, txUtil, (int)noise);
+#ifdef ARCH_NRF52
+    {
+        char resets[160];
+        nrf52DescribeResetLog(resets, sizeof(resets));
+        if (len > 0 && (size_t)len < sizeof(replyMsg) && resets[0])
+            len += snprintf(replyMsg + len, sizeof(replyMsg) - len, "\nResets:\n%s", resets);
+    }
+#endif
+    appendHealthWarnings(len);
 }

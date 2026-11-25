@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// See LICENSE for the full license text.
 #pragma once
 
 #include "configuration.h"
@@ -6,12 +8,14 @@
 
 #include "Channels.h"
 #include "MeshCoreDedup.h"
+#include "MeshCoreDeferredAdverts.h"
 #include "MeshCoreNodeFile.h"
 #include "MeshCoreNodeStore.h"
 #include "MeshCoreRepeater.h"
 #include "MeshCoreRepeaterNames.h"
 #include "MeshCoreSecretCache.h"
 #include "MeshTypes.h"
+#include "concurrency/RecursiveLock.h"
 #include "memory/MemClass.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -236,7 +240,7 @@ class MeshCoreCompanion
 
     /// Format a single route line, unified across .path and MeshCore PPING replies. signal picks the metrics shown, so PPING
     /// can honour its SNR/RSSI/FREQERR toggles and .path can omit the frequency error it does not have. header, when set,
-    /// shares the first line with the hop count ("<header> · 📡 N hops"); the hop names follow one per line.
+    /// shares the first line with the hop count ("<header> · 📡 N saltos"); the hop names follow one per line.
     bool formatRouteLine(const HeardPath &route, char *out, size_t cap, float freqErr = 0.0f, uint8_t signal = SIGNAL_ALL,
                          const char *header = nullptr) const;
 
@@ -351,7 +355,11 @@ class MeshCoreCompanion
     bool hasIdentity() const { return identityReady; }
 
     /// True when node is a direct-message contact we hold a public key for.
-    bool hasContact(uint32_t nodeNum) { return contactByNodeNum(nodeNum) != nullptr; }
+    bool hasContact(uint32_t nodeNum)
+    {
+        concurrency::RecursiveLockGuard guard(lock);
+        return contactByNodeNum(nodeNum) != nullptr;
+    }
     /// True when nodeNum is a known CHAT contact and matches the provided 32-byte public key.
     bool isMeshCoreContact(uint32_t nodeNum, const uint8_t pubKey[32]) const;
     /// True when p is a direct text this companion injected for a contact, carrying that contact's key. The router keeps
@@ -361,8 +369,8 @@ class MeshCoreCompanion
     /// Learn or refresh a chat contact, numbered from its name the first time and keeping that number afterwards.
     MeshCoreNode *learnContact(const uint8_t pub[32], const char *name);
     /// The next node, from slot cursor on, that a client which just synced has not been told about: in the store but no
-    /// longer in the node DB. A consistent copy goes to out (the radio may be writing the store meanwhile) and cursor moves
-    /// past it. False when the walk is done.
+    /// longer in the node DB. The copy is taken under storeLock(), so a write from the radio thread cannot tear it; cursor
+    /// moves past it. False when the walk is done.
     bool nextReplayNode(size_t &cursor, MeshCoreNode &out) const;
 
     /// Remember a repeater heard now: the start of its key, its node number, a short name and how and when it was heard, which
@@ -376,10 +384,16 @@ class MeshCoreCompanion
     /// Restore one saved repeater record laid out as `tail` says. False when it names nothing.
     bool restoreRepeater(const uint8_t *record, const MeshCoreNodeFile::RepeaterTail &tail)
     {
+        concurrency::RecursiveLockGuard guard(lock);
+        storeChanges++;
         return MeshCoreNodeFile::readRepeaterRecord(repeaters, record, tail);
     }
     /// Changes when the set of repeaters or a name does, not when one is heard again.
-    uint32_t repeatersFingerprint() const { return repeaters.fingerprint(); }
+    uint32_t repeatersFingerprint() const
+    {
+        concurrency::RecursiveLockGuard guard(lock);
+        return repeaters.fingerprint();
+    }
 
     /// Queue a TXT_MSG for the contact behind nodeNum and wait for a repeater to re-flood it, then for its ACK, answering
     /// packetId to the client. text is cut to MAX_TEXT_LEN on a UTF-8 boundary. False if not queued.
@@ -388,8 +402,17 @@ class MeshCoreCompanion
     /// How long a direct message waits for its ACK before the client is told it failed.
     static constexpr uint32_t ACK_TIMEOUT_MS = 30000;
 
-    /// Run periodically: report direct messages whose ACK never came.
+    /// Run periodically: report direct messages whose ACK never came, and check one deferred ADVERT's signature.
     void service();
+
+    /// Check the signature of the oldest ADVERT waiting for one and, if it holds, take the advert in. The receive path never
+    /// runs Ed25519 (the radio would be deaf meanwhile): an advert the signature caches do not know yet waits for this.
+    void verifyDeferredAdvert();
+    bool hasDeferredAdverts() const
+    {
+        concurrency::RecursiveLockGuard guard(lock);
+        return !deferredAdverts.empty();
+    }
 
     /// The MeshCore nodes worth keeping across a reboot as a flash image (MeshCoreNodeFile): favourites, then
     /// conversations, then the rest. Returns the image length, 0 if cap is below MeshCoreNodeFile::IMAGE_MAX.
@@ -398,8 +421,22 @@ class MeshCoreCompanion
     /// Restore nodes from an exportContacts() image, or from the contacts file of earlier builds. Returns how many loaded.
     size_t importContacts(const uint8_t *buf, size_t len);
 
-    /// Checksum of the saved set (not its order), to save only when it changed.
+    /// Checksum of the saved set (not its order), to save only when it changed. Syncs with the node DB first.
     uint32_t contactsFingerprint();
+
+    /// Moves on whenever the nodes or the repeater names may have changed: while it stays put, the fingerprints (a pass
+    /// over every stored node) cannot have changed either and need not be computed.
+    uint32_t storeRevision() const
+    {
+        concurrency::RecursiveLockGuard guard(lock);
+        return storeChanges + nodes.getRevision() + repeaters.getRevision();
+    }
+    /// For code that writes a node field straight through a pointer, under storeLock(): the stores cannot see that.
+    void noteStoreChanged() { storeChanges++; }
+
+    /// Mark our nodes in the node DB as MeshCore (evicted early) and copy back the client's favourite stars, which it sets
+    /// there. One node DB lookup per stored node: run it on a slow cadence, not every housekeeping tick.
+    void syncWithNodeDB();
 
     /// Mark one of our own transmitted frames seen, so hearing it back does not inject it.
     void noteTransmitted(const uint8_t *raw, size_t len);
@@ -407,10 +444,19 @@ class MeshCoreCompanion
     uint32_t rxSeen = 0, rxDecoded = 0, rxDup = 0, rxIgnored = 0, txSent = 0;
     uint32_t contactsLearned = 0, dmRx = 0, dmTx = 0, dmAcked = 0, dmTimedOut = 0, groupEchoed = 0, groupTimedOut = 0;
 
-    /// Every MeshCore node we know, kept apart from the Meshtastic node DB.
+    /// Every MeshCore node we know, kept apart from the Meshtastic node DB. Read and written from several tasks (the radio
+    /// thread, the Nexus CLI, and on nRF52 the BLE task through PhoneAPI): code outside this class holds storeLock() while it
+    /// touches it. The public members of this class take the lock themselves.
     MeshCoreNodeStore<MESHCORE_NODES_MAX> nodes;
 
+    /// Guards nodes, repeaters and the pending/heard tables. Recursive: the entry points call one another.
+    concurrency::RecursiveLock &storeLock() const { return lock; }
+
   private:
+    mutable concurrency::RecursiveLock lock;
+    /// Bumped by every entry point that may write a node field directly, which the stores' own revisions cannot see.
+    uint32_t storeChanges = 0;
+
     static constexpr size_t DEDUP_ENTRIES = 64;
 
     /// Cached channelHash() per channel slot, recomputed when the key bytes change.
@@ -444,9 +490,15 @@ class MeshCoreCompanion
     static constexpr size_t PENDING_ACKS = 8;
     PendingAck pending[PENDING_ACKS];
 
+    /// The route the store holds for n: its last measured hops and signal, else its learned out-path length, else one hop
+    /// with no signal. What an unsigned frame naming n is shown with, so it cannot rewrite n's route.
+    static MeshCoreRx storedRoute(const MeshCoreNode &n);
     void handleGroupText(const uint8_t *raw, size_t len, const MeshCoreRepeater::FrameInfo &info, float snr, int32_t rssi,
                          float freqErr);
     void handleAdvert(const uint8_t *raw, size_t len, const MeshCoreRepeater::FrameInfo &info, float snr, int32_t rssi);
+    /// True when the advert's signature is already proven. An advert not checked yet is deferred, a forged one refused.
+    bool advertProven(const uint8_t *raw, size_t len, const MeshCoreRepeater::FrameInfo &info, float snr, int32_t rssi);
+    MeshCoreDeferredAdverts deferredAdverts;
     void handleDirectText(const uint8_t *raw, size_t len, const MeshCoreRepeater::FrameInfo &info, float snr, int32_t rssi,
                           float freqErr);
     void handleAck(const uint8_t *raw, size_t len, const MeshCoreRepeater::FrameInfo &info);
@@ -472,9 +524,6 @@ class MeshCoreCompanion
     const uint8_t *secretFor(const MeshCoreNode &n);
     MeshCoreNode *contactByPub(const uint8_t pub[32]);
     MeshCoreNode *contactByNodeNum(uint32_t nodeNum);
-    /// Mark our nodes in the node DB as MeshCore (evicted early) and copy back the client's favourite stars, which it sets
-    /// there.
-    void syncWithNodeDB();
     /// Keep what an ADVERT says about n: its timestamp, position, and RF reception metrics.
     void noteAdvert(MeshCoreNode *n, uint32_t advertTime, int32_t latMicro, int32_t lonMicro, float snr, int32_t rssi,
                     uint8_t hops);
@@ -551,11 +600,27 @@ class MeshCoreCompanion
     InjectedDirect injectedDirect[INJECTED_DIRECTS];
     size_t injectedDirectNext = 0;
 
+    /// What a contact's star needs once syncFavorite() has run: nothing more, or to be set on its node DB copy.
+    enum class FavoriteSync : uint8_t { DONE, PUSH_TO_NODE_DB };
+    /// Keep a contact's star in step with its node DB copy (see syncWithNodeDB). Never writes the node DB itself: setting
+    /// a favourite may re-sort it, which would break the walk over it.
+    FavoriteSync syncFavorite(MeshCoreNode &n, const meshtastic_NodeInfoLite *lite);
+
+    /// The stored nodes sorted by node number, rebuilt for each syncWithNodeDB(): one walk over the node DB then finds each
+    /// of its MeshCore nodes by binary search, instead of one node DB scan per stored node.
+    struct SyncSlot {
+        MeshCoreNode *node;
+        bool inNodeDb;
+    };
+    SyncSlot syncIndex[MESHCORE_NODES_MAX];
+    size_t indexStoreByNodeNum();
+    SyncSlot *findIndexed(uint32_t nodeNum, size_t indexed);
+    /// Stars a single sync sets on node DB copies; any beyond wait for the next sync.
+    static constexpr size_t STARS_PUSHED_PER_SYNC = 8;
+
     /// Tell the router, and through it the client, about a node: a NODEINFO packet from it carrying how the frame was heard.
     /// That packet is what puts the node in the node DB with its name, last-heard, signal, hops and the LoRa slot it was
     /// heard on, exactly as for a Meshtastic node.
-    /// Keep a contact's star in step with its node DB copy (see syncWithNodeDB).
-    static void syncFavorite(MeshCoreNode &n, const meshtastic_NodeInfoLite *lite);
     void announceUser(uint32_t nodeNum, const meshtastic_User &user, const MeshCoreRx &rx);
     void announceIfNeeded(uint32_t nodeNum, const meshtastic_User &user, const MeshCoreRx &rx);
 

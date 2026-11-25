@@ -1,7 +1,10 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// See LICENSE for the full license text.
 // MeshCore side of RadioLibInterface: raw frame TX, the relay and ADVERT schedule, the repeater identity and the
 // companion bridge. Kept out of RadioLibInterface.cpp so that file stays close to the jentastic upstream and a merge of
 // origin/main does not collide with this code. The hooks that call into it remain in RadioLibInterface.cpp.
 #include "ContentionStats.h"
+#include "MeshCoreProtocol.h"
 #include "MeshTypes.h"
 #include "NodeDB.h"
 #include "PowerMon.h"
@@ -157,6 +160,9 @@ static constexpr uint32_t MESHCORE_CONTACTS_SAVE_MIN_MS = 60 * 60 * 1000; // fla
 // Repeater names change all the time (every advert heard from a new one) and are relearned from the next advert, so they only
 // earn a flash write now and then. The file is rewritten whole, contacts included, whichever of the two asked for it.
 static constexpr uint32_t MESHCORE_REPEATERS_SAVE_MIN_MS = 3 * 60 * 60 * 1000; // at most one save per 3 hours for them
+// Marks and favourite stars need not follow the node DB within seconds; the sync costs a lookup per stored node.
+static constexpr uint32_t MESHCORE_NODEDB_SYNC_MS = 60 * 1000;
+static_assert(MESHCORE_CONTACTS_SAVE_MIN_MS <= MESHCORE_REPEATERS_SAVE_MIN_MS, "the save gate waits for the shorter");
 static constexpr uint32_t MESHCORE_TX_POLL_MS = 100;                      // a raw frame is on air: look again for a lost TX-done
 
 /** Runs RadioLibInterface::meshCoreAdvertTick() on its own schedule. */
@@ -358,6 +364,9 @@ static void loadMeshCoreContacts()
 static bool saveMeshCoreContacts()
 {
 #ifdef FSCom
+    // The repeater walk below holds pointers into the table: no other task may rewrite it until the file is closed. Saves
+    // are hours apart, so holding the lock across the flash write costs little.
+    concurrency::RecursiveLockGuard storeGuard(meshCoreCompanion.storeLock());
     uint8_t image[MeshCoreNodeFile::IMAGE_MAX];
     const size_t n = meshCoreCompanion.exportContacts(image, sizeof(image));
     if (n == 0)
@@ -432,30 +441,53 @@ uint32_t RadioLibInterface::meshCoreServiceTick()
         loadMeshCoreContacts();
         meshCoreContactsFingerprint = meshCoreCompanion.contactsFingerprint();
         meshCoreRepeatersFingerprint = meshCoreCompanion.repeatersFingerprint();
+        meshCoreStoreRevisionSeen = meshCoreCompanion.storeRevision();
         lastMeshCoreContactsSaveMs = millis();
     }
 
     meshCoreCompanion.service();
 
-    if (meshCoreContactsLoaded) {
-        const uint32_t contacts = meshCoreCompanion.contactsFingerprint();
-        const uint32_t repeaters = meshCoreCompanion.repeatersFingerprint();
-        // A change to the contacts waits for its window; one to the repeater names alone waits for the longer one.
-        const bool due = (contacts != meshCoreContactsFingerprint &&
-                          Throttle::hasElapsed(lastMeshCoreContactsSaveMs, MESHCORE_CONTACTS_SAVE_MIN_MS)) ||
-                         (repeaters != meshCoreRepeatersFingerprint &&
-                          Throttle::hasElapsed(lastMeshCoreContactsSaveMs, MESHCORE_REPEATERS_SAVE_MIN_MS));
-        if (due) {
-            if (saveMeshCoreContacts()) {
-                meshCoreContactsFingerprint = contacts;
-                meshCoreRepeatersFingerprint = repeaters;
-            }
-            lastMeshCoreContactsSaveMs = millis();
-        }
+    if (meshCoreContactsLoaded && Throttle::hasElapsed(lastMeshCoreNodeDbSyncMs, MESHCORE_NODEDB_SYNC_MS)) {
+        meshCoreCompanion.syncWithNodeDB();
+        lastMeshCoreNodeDbSyncMs = millis();
     }
+
+    if (meshCoreContactsLoaded)
+        saveMeshCoreContactsIfChanged();
 #endif
     return next < MESHCORE_SERVICE_MS ? next : MESHCORE_SERVICE_MS;
 }
+
+#if MESHTASTIC_ENABLE_MESHCORE_COMPANION
+void RadioLibInterface::saveMeshCoreContactsIfChanged()
+{
+    // Nothing can be saved before the shorter window has run out.
+    if (!Throttle::hasElapsed(lastMeshCoreContactsSaveMs, MESHCORE_CONTACTS_SAVE_MIN_MS))
+        return;
+    // The fingerprints are a pass over every stored node and repeater: computed again only once the store has changed.
+    const uint32_t revision = meshCoreCompanion.storeRevision();
+    if (revision != meshCoreStoreRevisionSeen) {
+        meshCoreStoreRevisionSeen = revision;
+        meshCoreContactsChanged = meshCoreCompanion.contactsFingerprint() != meshCoreContactsFingerprint;
+        meshCoreRepeatersChanged = meshCoreCompanion.repeatersFingerprint() != meshCoreRepeatersFingerprint;
+    }
+    // A change to the contacts waits for its window; one to the repeater names alone waits for the longer one.
+    const bool due = meshCoreContactsChanged ||
+                     (meshCoreRepeatersChanged && Throttle::hasElapsed(lastMeshCoreContactsSaveMs, MESHCORE_REPEATERS_SAVE_MIN_MS));
+    if (!due)
+        return;
+    // Fingerprinted again at save time: the store may have moved on since, and what is written is what is on flash.
+    const uint32_t contacts = meshCoreCompanion.contactsFingerprint();
+    const uint32_t repeaters = meshCoreCompanion.repeatersFingerprint();
+    if (saveMeshCoreContacts()) {
+        meshCoreContactsFingerprint = contacts;
+        meshCoreRepeatersFingerprint = repeaters;
+        meshCoreContactsChanged = meshCoreRepeatersChanged = false;
+        meshCoreStoreRevisionSeen = meshCoreCompanion.storeRevision();
+    }
+    lastMeshCoreContactsSaveMs = millis();
+}
+#endif
 
 // The announced MeshCore type follows the Meshtastic role: a router is a repeater, anything else a companion to
 // message. A node that relays under a chat identity also needs the alias, so the hop it appends belongs to a repeater
@@ -885,7 +917,11 @@ void RadioLibInterface::maybeSendMeshCoreFrame()
         startReceive(); // the channel scan left the radio in standby
         return;
     }
-    LOG_INFO("MeshCore TX %s: len=%u header=0x%02x path_len=0x%02x", own ? "own" : "relay", (unsigned)len, frame[0], frame[1]);
+    // path_len follows the 4 bytes of transport codes on a transport route, so it is read where the route puts it.
+    const uint8_t routeType = frame[0] & 0x03;
+    const size_t pathLenAt = (routeType == MC_ROUTE_TRANSPORT_FLOOD || routeType == MC_ROUTE_TRANSPORT_DIRECT) ? 5 : 1;
+    LOG_INFO("MeshCore TX %s: len=%u header=0x%02x path_len=0x%02x", own ? "own" : "relay", (unsigned)len, frame[0],
+             pathLenAt < len ? frame[pathLenAt] : 0);
     if (!own)
         meshCoreRepeater.markRelayed();
     meshCoreRepeater.clearPendingFrame();

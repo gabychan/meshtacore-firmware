@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// See LICENSE for the full license text.
 #pragma once
 
 #include "MeshCoreConfig.h"
@@ -25,9 +27,10 @@
  * Meshtastic unicast between two other nodes (a few percent of overheard DMs by length); those
  * are sniffed instead of routed. Broadcasts and DMs to/from this node are never misclassified.
  *
- * Scope note: MeshCore's own repeaters also enforce region scoping (transport codes vs
- * REGION_DENY_FLOOD); this relay has no region map, so it forwards scoped floods too - same trust
- * model as a MeshCore repeater blind to the MAC. ADVERT signatures are verified before forwarding.
+ * Scope note: like MeshCore's own repeaters, the relay enforces region scoping through its region map
+ * (MeshCoreRegionMap: transport codes vs REGION_DENY_FLOOD); with an empty map it forwards scoped
+ * floods too, the same trust model as a MeshCore repeater blind to the MAC. ADVERT signatures are
+ * verified before forwarding.
  */
 // Direct-neighbour table fed by the ADVERTs the relay hears. With a companion the contact table already holds them, so
 // the relay keeps its own only when there is none.
@@ -88,11 +91,9 @@ class MeshCoreRepeater
     static uint32_t hashFrame(const uint8_t *raw, size_t len, const FrameInfo &info);
 
     /**
-     * Handle a received MeshCore frame (raw bytes as demodulated). Sniffs always; relays floods
-     * if enabled. airtimeMs is the frame's on-air time (RadioInterface::getPacketTime), used to
-     * size the adaptive relay delay.
-     */
-    /**
+     * Handle a received MeshCore frame (raw bytes as demodulated). Sniffs always; relays floods if enabled. airtimeMs is the
+     * frame's on-air time (RadioInterface::getPacketTime), used to size the adaptive relay delay.
+     *
      * Returns false when the firewall dropped the frame (a /mtc DROP rule, an ignored node, a rate limit): nothing else, the
      * companion included, should see it. True for everything else, even a frame that is not MeshCore at all.
      */
@@ -208,10 +209,18 @@ class MeshCoreRepeater
     /** Check an ADVERT payload's Ed25519 signature over pub_key || timestamp || app_data. */
     static bool verifyAdvert(const uint8_t *payload, size_t payloadLen);
 
-    /** Ed25519 verifications actually run; a payload already proven good is answered from a small cache instead. */
+    /** What the signature caches already know about an ADVERT payload, without running Ed25519. */
+    enum class AdvertVerdict : uint8_t { UNKNOWN, GENUINE, FORGED };
+    static constexpr size_t ADVERT_DIGEST_LEN = 16;
+    /** The digest an ADVERT payload is cached under (truncated SHA-256). */
+    static void advertDigest(const uint8_t *payload, size_t payloadLen, uint8_t out[ADVERT_DIGEST_LEN]);
+    static AdvertVerdict cachedAdvertVerdict(const uint8_t digest[ADVERT_DIGEST_LEN]);
+    static AdvertVerdict cachedAdvertVerdict(const uint8_t *payload, size_t payloadLen);
+
+    /** Ed25519 verifications actually run; a payload already proven good or bad is answered from a small cache instead. */
     static uint32_t advertSignatureChecks;
 
-    /** Empty the cache of verified ADVERT payloads (tests start from a clean slate). */
+    /** Empty the caches of verified and rejected ADVERT payloads (tests start from a clean slate). */
     static void forgetVerifiedAdverts();
 
     /**
@@ -330,11 +339,17 @@ class MeshCoreRepeater
     uint8_t fwHopRatePerMin = 0;
     uint32_t fwRuleDrops[MeshCoreConfig::DROP_RULE_COUNT] = {};
 
-    // Last time an advert of each of the latest keys was kept, and how many frames each neighbouring repeater got through.
+    // Last time a genuine advert of each of the latest keys was kept, and how many frames each neighbouring repeater got
+    // through. The firewall never runs Ed25519 itself: an advert not yet proven waits as the key's candidate until the
+    // companion or the relay has checked it, and only then opens the gap, dated from when it arrived.
     static constexpr size_t ADVERT_SEEN_SIZE = 16;
     struct AdvertSeen {
         uint32_t key = 0;
         uint32_t atMs = 0;
+        bool gapOpen = false;
+        bool hasCandidate = false;
+        uint32_t candidateAtMs = 0;
+        uint8_t candidate[ADVERT_DIGEST_LEN] = {};
     };
     AdvertSeen advertSeen[ADVERT_SEEN_SIZE];
     uint8_t advertSeenNext = 0;
@@ -359,6 +374,9 @@ class MeshCoreRepeater
     /** True when the firewall drops this frame; counts it against the rule that did. */
     bool frameFiltered(const uint8_t *raw, const FrameInfo &info);
     bool rateLimited(const uint8_t *raw, const FrameInfo &info);
+    /** True when this key already sent a genuine advert within the gap; files a not-yet-proven one as its candidate. */
+    bool advertWithinGap(const uint8_t *payload, size_t payloadLen);
+    AdvertSeen &advertSlotFor(uint32_t key);
 
     /** True when the frame comes from an ignored node: its ADVERT or anonymous request, a message whose one-byte source hash
      * is one's, or a flood whose last hop is one. */

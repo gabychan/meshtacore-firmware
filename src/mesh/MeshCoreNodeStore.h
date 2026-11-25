@@ -1,4 +1,8 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// See LICENSE for the full license text.
 #pragma once
+
+#include "MeshCoreNodeNum.h"
 
 #include "configuration.h" // the ARCH_* macros the memory classes key off
 #include "memory/MemClass.h"
@@ -8,14 +12,19 @@
 #include <string.h>
 
 // About 120 B a node, all in RAM. LARGE matches MeshCore's own MAX_CONTACTS; the rest follow the class budgets.
+// An nRF52 companion with a screen and a GPS (the ThinkNode M1) is the tight one: measured with 88 % of its heap used and
+// 14 KB free. HAS_GPS is no help here: boards leave it 0 and name the GPS pins.
+#if MESHTASTIC_MEM_CLASS == MEM_CLASS_SMALL && HAS_SCREEN && defined(ARCH_NRF52) && defined(GPS_RX_PIN)
+#define MESHCORE_HEAP_TIGHT_BOARD 1
+#endif
+
 #ifndef MESHCORE_NODES_MAX
 #if MESHTASTIC_MEM_CLASS <= MEM_CLASS_TINY
 #define MESHCORE_NODES_MAX 16
 #elif MESHTASTIC_MEM_CLASS == MEM_CLASS_SMALL
-#if HAS_SCREEN && defined(ARCH_NRF52) && defined(GPS_RX_PIN)
-// An nRF52 companion with a screen and a GPS (the ThinkNode M1) is the tight one: measured with 88 % of its heap used and
-// 14 KB free. Contacts only need room for the favourites and the few people it writes to, and repeaters have their own
-// table (MeshCoreRepeaterNames.h), so 16 are enough. HAS_GPS is no help here: boards leave it 0 and name the GPS pins.
+#ifdef MESHCORE_HEAP_TIGHT_BOARD
+// Contacts only need room for the favourites and the few people it writes to, and repeaters have their own table
+// (MeshCoreRepeaterNames.h), so 16 are enough.
 #define MESHCORE_NODES_MAX 16
 #elif HAS_SCREEN
 #define MESHCORE_NODES_MAX 30
@@ -94,7 +103,7 @@ template <size_t N> class MeshCoreNodeStore
         uint32_t h = 2166136261u; // FNV-1a
         for (const char *p = name; p && *p; p++)
             h = (h ^ (uint8_t)*p) * 16777619u;
-        return 0x4D000000 | ((h ^ (h >> 24)) & 0x00FFFFFF);
+        return meshCoreNodeNum(h ^ (h >> 24));
     }
 
     /// Node number for a node known by its key alone (a repeater): hashed from the public key.
@@ -103,7 +112,7 @@ template <size_t N> class MeshCoreNodeStore
         uint32_t h = 2166136261u; // FNV-1a
         for (size_t i = 0; i < 32; i++)
             h = (h ^ pub[i]) * 16777619u;
-        return 0x4D000000 | ((h ^ (h >> 24)) & 0x00FFFFFF);
+        return meshCoreNodeNum(h ^ (h >> 24));
     }
 
     /// Give n the wanted node number, moved on while another node owns it or it is reserved.
@@ -112,8 +121,9 @@ template <size_t N> class MeshCoreNodeStore
         n->nodeNum = 0; // so n does not collide with itself
         uint32_t num = wanted;
         while (findByNodeNum(num) || num == reserved)
-            num = 0x4D000000 | ((num + 1) & 0x00FFFFFF);
+            num = meshCoreNodeNum(num + 1);
         n->nodeNum = num;
+        revision++;
     }
 
     /// The node with this key, created if new. Refreshes its recency either way.
@@ -202,29 +212,43 @@ template <size_t N> class MeshCoreNodeStore
         return collectByPrefix(entries, prefix, size, out, max);
     }
 
-    void touch(MeshCoreNode *n) { n->lastMod = ++clock; }
+    void touch(MeshCoreNode *n)
+    {
+        n->lastMod = ++clock;
+        revision++;
+    }
 
     void noteDirectMessage(MeshCoreNode *n)
     {
         n->flags |= MeshCoreNode::HAD_DM;
         n->lastDm = ++clock;
+        revision++;
     }
 
     void setFavorite(MeshCoreNode *n, bool on)
     {
+        if (n->isFavorite() == on)
+            return;
         if (on)
             n->flags |= MeshCoreNode::FAVORITE;
         else
             n->flags &= ~MeshCoreNode::FAVORITE;
+        revision++;
     }
 
     bool remove(const uint8_t pub[32])
     {
         MeshCoreNode *n = find(pub);
-        if (n)
-            *n = MeshCoreNode();
-        return n != nullptr;
+        if (!n)
+            return false;
+        *n = MeshCoreNode();
+        revision++;
+        return true;
     }
+
+    /// Moves on with every change made through this class: equal values mean nothing was added, removed, touched,
+    /// renumbered or starred in between. A field written straight through a node pointer does not move it.
+    uint32_t getRevision() const { return revision; }
 
     static constexpr size_t capacity() { return N; }
 
@@ -296,6 +320,7 @@ template <size_t N> class MeshCoreNodeStore
         return total;
     }
     uint32_t clock = 0;
+    uint32_t revision = 0;
 
     /// A free slot, else the oldest node not kept, else the oldest of all.
     size_t victim() const

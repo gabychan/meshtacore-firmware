@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// See LICENSE for the full license text.
 #pragma once
 
 #include "MeshCoreNodeStore.h" // nodeNumForKey
@@ -319,11 +321,16 @@ template <size_t N> class MeshCoreRepeaterNames
         for (Entry &e : entries)
             e = Entry();
         clock = 0;
+        revision++;
     }
+
+    /// Moves on with every learn, restore and clear: equal values mean the table has not changed in between.
+    uint32_t getRevision() const { return revision; }
 
   private:
     Entry entries[N];
     uint16_t clock = 0;
+    uint32_t revision = 0;
     static constexpr uint32_t NO_STAMP_ABOVE = 0x10000; // above every 16-bit stamp
 
     static size_t nameLength(const Entry &e)
@@ -349,6 +356,7 @@ template <size_t N> class MeshCoreRepeaterNames
         if (clock == 0xFFFF)
             renumber();
         e->heard = ++clock;
+        revision++;
     }
 
     void renumber()

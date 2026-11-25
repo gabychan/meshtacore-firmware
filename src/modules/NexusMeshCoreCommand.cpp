@@ -105,7 +105,7 @@ static void formatAgo(uint32_t secs, char *out, size_t len)
 
 static bool isDirectNeighbor(const meshtastic_NodeInfoLite *n, uint32_t myNum)
 {
-    return n && n->num != 0 && n->num != myNum && !nodeInfoLiteIsMeshCore(n) && (n->num & 0xFF000000) != 0x4D000000 &&
+    return n && n->num != 0 && n->num != myNum && !nodeInfoLiteIsMeshCorePeer(n) &&
            n->has_hops_away && n->hops_away == 0 && n->last_heard != 0;
 }
 
@@ -418,6 +418,10 @@ static constexpr size_t NEIGHBOR_LIST_MAX = 32; // newest first, like the relay'
 /// Contacts whose last advert reached us without crossing a repeater.
 static void addContactNeighbors(NexusModule::DirectNeighborEntry *entries, size_t *count)
 {
+#if MESHTASTIC_ENABLE_MESHCORE_COMPANION
+    // The companion tables are written by the radio thread too: hold them for the whole command.
+    concurrency::RecursiveLockGuard storeGuard(meshCoreCompanion.storeLock());
+#endif
     meshCoreCompanion.nodes.forEach([&](const MeshCoreNode &n) {
         if (!isDirectNeighbor(n))
             return;
@@ -438,7 +442,7 @@ static void addNodeDbNeighbors(NexusModule::DirectNeighborEntry *entries, size_t
     const uint32_t myNum = myNodeInfo.my_node_num != 0 ? myNodeInfo.my_node_num : nodeDB->getNodeNum();
     for (size_t i = 0; i < nodeDB->getNumMeshNodes(); i++) {
         const meshtastic_NodeInfoLite *n = nodeDB->getMeshNodeByIndex(i);
-        if (!n || n->num == 0 || n->num == myNum || !(nodeInfoLiteIsMeshCore(n) || (n->num & 0xFF000000) == 0x4D000000) ||
+        if (!n || n->num == 0 || n->num == myNum || !nodeInfoLiteIsMeshCorePeer(n) ||
             !n->has_hops_away || n->hops_away != 0 || n->last_heard == 0 || listsNeighbor(entries, *count, n->num, n->long_name))
             continue;
         const char *srcName = n->long_name[0] ? n->long_name : (n->short_name[0] ? n->short_name : "???");
@@ -454,6 +458,10 @@ static void addNodeDbNeighbors(NexusModule::DirectNeighborEntry *entries, size_t
 /// Repeaters heard directly this boot that the node DB no longer holds (it evicts MeshCore nodes first): their short name.
 static void addRepeaterTableNeighbors(NexusModule::DirectNeighborEntry *entries, size_t *count)
 {
+#if MESHTASTIC_ENABLE_MESHCORE_COMPANION
+    // The companion tables are written by the radio thread too: hold them for the whole command.
+    concurrency::RecursiveLockGuard storeGuard(meshCoreCompanion.storeLock());
+#endif
     const MeshCoreCompanion::RepeaterTable &table = meshCoreCompanion.repeaterNames();
     const uint32_t uptime = Time::getUptimeSecs();
     const uint32_t now = getTime(false);
@@ -563,6 +571,10 @@ static bool parseHexBytes(const char *str, uint8_t *out, uint8_t *lenOut, uint8_
 
 void NexusModule::handleMeshCoreFavCommand(const char *args, char *reply, size_t replyLen)
 {
+#if MESHTASTIC_ENABLE_MESHCORE_COMPANION
+    // The companion tables are written by the radio thread too: hold them for the whole command.
+    concurrency::RecursiveLockGuard storeGuard(meshCoreCompanion.storeLock());
+#endif
 #if MESHTASTIC_ENABLE_MESHCORE_COMPANION
     char word[16];
     const char *rest = takeWord(args, word, sizeof(word));
@@ -686,6 +698,10 @@ void NexusModule::handleMeshCoreDiscoverCommand(const char *args, const ReplyCon
 
 void NexusModule::finishMeshCoreDiscover()
 {
+#if MESHTASTIC_ENABLE_MESHCORE_COMPANION
+    // The companion tables are written by the radio thread too: hold them for the whole command.
+    concurrency::RecursiveLockGuard storeGuard(meshCoreCompanion.storeLock());
+#endif
     meshCoreDiscoverPending = false;
     if (!RadioLibInterface::instance)
         return;
@@ -709,6 +725,7 @@ void NexusModule::finishMeshCoreDiscover()
         const bool wasKnown = meshCoreCompanion.nodes.find(peer.pub) != nullptr;
         MeshCoreNode *n = meshCoreCompanion.nodes.upsertIfRoom(peer.pub);
         if (n) {
+            meshCoreCompanion.noteStoreChanged();
             // The discover answer is unsigned: it may name a new node's type, never overwrite one an ADVERT set.
             if (!wasKnown) {
                 added++;
@@ -1097,6 +1114,10 @@ void NexusModule::handleRegionCommand(const char *args, char *reply, size_t repl
 static void handleMeshCorePathCommand(const char *arg, char *reply, size_t replyLen)
 {
 #if MESHTASTIC_ENABLE_MESHCORE_COMPANION
+    // The companion tables are written by the radio thread too: hold them for the whole command.
+    concurrency::RecursiveLockGuard storeGuard(meshCoreCompanion.storeLock());
+#endif
+#if MESHTASTIC_ENABLE_MESHCORE_COMPANION
     while (*arg == ' ')
         arg++;
     if (*arg == '\0') {
@@ -1181,6 +1202,10 @@ static void handleMeshCoreNodeDetailCommand(const char *arg, char *reply, size_t
 
 static void handleMeshCoreSendCommand(const char *args, char *reply, size_t replyLen)
 {
+#if MESHTASTIC_ENABLE_MESHCORE_COMPANION
+    // The companion tables are written by the radio thread too: hold them for the whole command.
+    concurrency::RecursiveLockGuard storeGuard(meshCoreCompanion.storeLock());
+#endif
 #if MESHTASTIC_ENABLE_MESHCORE_COMPANION
     char target[32];
     const char *text = takeWord(args, target, sizeof(target));
@@ -1515,7 +1540,7 @@ bool NexusModule::isMeshCorePing(const meshtastic_MeshPacket &mp, bool isPingDM)
     if (channels.isMeshCoreChannel((ChannelIndex)mp.channel))
         return true;
 #if MESHTASTIC_ENABLE_MESHCORE_COMPANION
-    if (isPingDM && (meshCoreCompanion.hasContact(mp.from) || (mp.from >> 24) == 0x4D))
+    if (isPingDM && (meshCoreCompanion.hasContact(mp.from) || (nodeDB && nodeInfoLiteIsMeshCorePeer(nodeDB->getMeshNode(mp.from)))))
         return true;
 #endif
     return false;
@@ -1523,6 +1548,10 @@ bool NexusModule::isMeshCorePing(const meshtastic_MeshPacket &mp, bool isPingDM)
 
 bool NexusModule::formatMeshCorePingReply(const meshtastic_MeshPacket &mp, char *rMsg, size_t rMsgLen)
 {
+#if MESHTASTIC_ENABLE_MESHCORE_COMPANION
+    // The companion tables are written by the radio thread too: hold them for the whole command.
+    concurrency::RecursiveLockGuard storeGuard(meshCoreCompanion.storeLock());
+#endif
     if (!rMsg || rMsgLen == 0)
         return false;
     rMsg[0] = '\0';
@@ -1597,6 +1626,10 @@ void NexusModule::handleMeshCorePpingCommand(const char *args, char *reply, size
 
 void NexusModule::handleMeshCorePingSend(const char *target, char *reply, size_t replyLen)
 {
+#if MESHTASTIC_ENABLE_MESHCORE_COMPANION
+    // The companion tables are written by the radio thread too: hold them for the whole command.
+    concurrency::RecursiveLockGuard storeGuard(meshCoreCompanion.storeLock());
+#endif
     while (*target == ' ')
         target++;
 
